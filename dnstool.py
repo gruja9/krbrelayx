@@ -355,12 +355,13 @@ def main():
                                                                           '(128 or 256 bits)')
     recordopts = parser.add_argument_group("Record options")
     recordopts.add_argument("-r", "--record", type=str, metavar='TARGETRECORD', help="Record to target (FQDN)")
+    recordopts.add_argument("-e", "--existing-record", type=str, metavar='EXISTINGRECORD', help="Existing record for 'manual_modify' action (FQDN)")
     recordopts.add_argument("-a",
                         "--action",
-                        choices=['add', 'modify', 'query', 'remove', 'resurrect', 'ldapdelete'],
+                        choices=['add', 'modify', 'manual_modify', 'query', 'remove', 'resurrect', 'ldapdelete'],
                         default='query',
                         help="Action to perform. Options: add (add a new record), modify ("
-                             "modify an existing record), query (show existing), remove (mark record "
+                             "modify an existing record), manual_modify (modify an existing record without read rights), query (show existing), remove (mark record "
                              "for cleanup from DNS cache), delete (delete from LDAP). Default: query"
                         )
     recordopts.add_argument("-t", "--type", choices=['A'], default='A', help="Record type to add (Currently only A records supported)")
@@ -475,6 +476,11 @@ def main():
 
 
     searchtarget = 'DC=%s,%s' % (zone, dnsroot)
+    if args.action == "manual_modify":
+        if not args.existing_record:
+            print_f('This operation requires you to specify an existing record with --existing-record')
+            return
+        target = args.existing_record
     # print s.info.naming_contexts
     c.search(searchtarget, '(&(objectClass=dnsNode)(name=%s))' % ldap3.utils.conv.escape_filter_chars(target), attributes=['dnsRecord','dNSTombstoned','name'])
     targetentry = None
@@ -484,13 +490,13 @@ def main():
         targetentry = entry
 
     # Check if we have the required data
-    if args.action in ['add', 'modify', 'remove'] and not args.data:
+    if args.action in ['add', 'modify', 'manual_modify', 'remove'] and not args.data:
         print_f('This operation requires you to specify record data with --data')
         return
     
 
     # Check if we need the target record to exists, and if yes if it does
-    if args.action in ['modify', 'remove', 'ldapdelete', 'resurrect', 'query'] and not targetentry:
+    if args.action in ['modify', 'manual_modify', 'remove', 'ldapdelete', 'resurrect', 'query'] and not targetentry:
         print_f('Target record not found!')
         return
 
@@ -557,6 +563,29 @@ def main():
         records.append(targetrecord.getData())
         print_m('Modifying record')
         c.modify(targetentry['dn'], {'dnsRecord': [(MODIFY_REPLACE, records)]})
+        print_operation_result(c.result)
+    # This action is used when we have write rights over a DNS record, but not read, which means we need to take the required information from another record and then overwrite the target record
+    elif args.action == 'manual_modify':
+        # Only A records for now
+        addtype = 1
+        # We already know the entry exists
+        targetrecord = None
+        records = []
+        for record in targetentry['raw_attributes']['dnsRecord']:
+            dr = DNS_RECORD(record)
+            if dr['Type'] == 1:
+                targetrecord = dr
+            else:
+                records.append(record)
+        if not targetrecord:
+            print_f('The supplied existing record does not have an A record')
+            return
+        targetrecord['Serial'] = get_next_serial(args.dns_ip, args.host, zone,args.tcp)
+        targetrecord['Data'] = DNS_RPC_RECORD_A()
+        targetrecord['Data'].fromCanonical(args.data)
+        records.append(targetrecord.getData())
+        print_m('Modifying record')
+        c.modify("DC=%s,DC=%s,%s" % (args.record, zone, dnsroot), {'dnsRecord': [(MODIFY_REPLACE, records)]})
         print_operation_result(c.result)
     elif args.action == 'remove':
         addtype = 0
